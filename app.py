@@ -161,11 +161,11 @@ async def get_m3u8_streams(video_id: str):
 
 
 # ==============================================================================
-# エンドポイント 3: /high/{video_id} (最高画質ストリームURL - googlevideo.com優先)
+# エンドポイント 3: /high/{video_id} (純粋な bestvideo+bestaudio 相当)
 # ==============================================================================
 @app.get("/high/{video_id}")
 async def get_high_quality_stream(video_id: str):
-    """指定した YouTube の video_id の最高画質ストリームURL (googlevideo.com の直接URL) を返す"""
+    """指定した YouTube の video_id の最高品質 (bestvideo+bestaudio相当) のストリームを返す"""
     
     # キャッシュを利用しつつフルデータを取得
     try:
@@ -173,59 +173,40 @@ async def get_high_quality_stream(video_id: str):
     except HTTPException as e:
         raise e
 
-    # --- フィルタリングロジック ---
     formats = info_data["formats"]
-    best_format = None
-
-    # 1. 統合ストリーム (動画+音声) かつ googlevideo.com の直接URL のみを抽出
-    target_combined_formats = [
-        f for f in formats 
-        if f.get("acodec") not in ["none", None] 
-        and f.get("vcodec") not in ["none", None]
-        # マニフェストを除外 (m3u8, mpd)
-        and f.get("protocol") not in ["m3u8_native", "http_dash_segments"] 
-        # googlevideo.com の直接URLに限定
-        and "googlevideo.com" in f.get("url", "") 
-    ]
-
-    # 2. 抽出された統合ストリームの中で最高品質のものを選ぶ
-    if target_combined_formats:
-        # vbr (動画ビットレート) を基準に降順でソートして、最初のものを選ぶ
-        sorted_combined = sorted(target_combined_formats, key=lambda x: x.get("vbr") or 0, reverse=True)
-        best_format = sorted_combined[0]
     
-    # 3. 統合ストリームが見つからなかった場合のフォールバック (最高画質の分離ストリーム)
-    if not best_format:
-        
-        # googlevideo.com の分離ストリームのみを抽出
-        separated_formats = [
-            f for f in formats 
-            if (f.get("acodec") in ["none", None] or f.get("vcodec") in ["none", None]) 
-            and f.get("url")
-            and "googlevideo.com" in f.get("url", "")
-            and f.get("protocol") not in ["m3u8_native", "http_dash_segments"]
-        ]
-        
-        # 最高の動画ストリーム (vcodecがあり、acodecがない)
-        best_video = next(
-            (
-                f for f in sorted(separated_formats, key=lambda x: x.get("vbr") or 0, reverse=True)
-                if f.get("vcodec") not in ["none", None] and f.get("acodec") in ["none", None]
-            ), 
-            None
-        )
-        
-        if best_video:
-            best_format = best_video
-            best_format['note'] = 'NOTE: This is a separate video stream (no audio) and the best direct video URL found.'
-        else:
-             raise HTTPException(status_code=404, detail="googlevideo.com からの直接的なストリームURLが見つかりませんでした。")
+    # 1. 最高の動画ストリーム (vcodecがあり、acodecがない) を探す
+    #    vbr (動画ビットレート) を基準に降順でソートして、最初のものを選ぶ
+    best_video_format = next(
+        (
+            f for f in sorted(formats, key=lambda x: x.get("vbr") or 0, reverse=True)
+            if f.get("vcodec") not in ["none", None] and f.get("acodec") in ["none", None]
+        ), 
+        None
+    )
 
-    # 4. 応答データの整理
+    # 2. 最高の音声ストリーム (acodecがあり、vcodecがない) を探す
+    #    abr (音声ビットレート) を基準に降順でソートして、最初のものを選ぶ
+    best_audio_format = next(
+        (
+            f for f in sorted(formats, key=lambda x: x.get("abr") or 0, reverse=True)
+            if f.get("acodec") not in ["none", None] and f.get("vcodec") in ["none", None]
+        ), 
+        None
+    )
+
+    if not best_video_format and not best_audio_format:
+        raise HTTPException(status_code=404, detail="最高品質の動画ストリームまたは音声ストリームが見つかりませんでした。")
+        
+    # 3. 応答データの整理
+    #    bestvideo+bestaudio は、動画と音声を別々に取得し、結合することを意味します。
+    #    ここではその2つのURLを返します。
     high_response = {
         "title": info_data["title"],
         "id": video_id,
-        "format": best_format
+        "best_video": best_video_format,
+        "best_audio": best_audio_format,
+        "note": "NOTE: To achieve best quality, you must combine 'best_video' and 'best_audio' streams using a tool like FFmpeg, as they are separate streams (DASH/HLS)."
     }
     
     return high_response
