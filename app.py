@@ -46,17 +46,16 @@ def cleanup_cache():
         del CACHE[vid]
     print(f"--- Cache Cleanup: Removed {len(expired)} entries. ---")
 
-
-# ==============================================================================
-# エンドポイント 1: /stream/{video_id} (全フォーマット)
-# ==============================================================================
-@app.get("/stream/{video_id}")
-async def get_streams(video_id: str):
-    """指定した YouTube の video_id のストリーム情報を返す"""
+# --- 情報取得のヘルパー関数（キャッシュ利用・更新機能を含む） ---
+async def _fetch_and_cache_info(video_id: str):
+    """
+    yt-dlp で情報を取得し、キャッシュから取得、またはキャッシュを更新する。
+    """
     current_time = time.time()
     cleanup_cache()
+    info_data = None
 
-    # --- キャッシュチェック ---
+    # キャッシュチェック
     if video_id in CACHE:
         timestamp, data, duration = CACHE[video_id]
         if current_time - timestamp < duration:
@@ -71,7 +70,7 @@ async def get_streams(video_id: str):
     try:
         # スレッドで yt-dlp を実行
         loop = asyncio.get_event_loop()
-        info = await loop.run_in_executor(executor, fetch_info)
+        raw_info = await loop.run_in_executor(executor, fetch_info)
 
         # --- フォーマット整理 ---
         formats = [
@@ -87,13 +86,13 @@ async def get_streams(video_id: str):
                 "vbr": f.get("vbr"),
                 "abr": f.get("abr"),
             }
-            for f in info.get("formats", [])
+            for f in raw_info.get("formats", [])
             if f.get("url") and f.get("ext") != "mhtml"
         ]
 
         # --- レスポンスデータ作成 ---
         response_data = {
-            "title": info.get("title"),
+            "title": raw_info.get("title"),
             "id": video_id,
             "formats": formats
         }
@@ -116,15 +115,24 @@ async def get_streams(video_id: str):
 
 
 # ==============================================================================
+# エンドポイント 1: /stream/{video_id} (全フォーマット)
+# ==============================================================================
+@app.get("/stream/{video_id}")
+async def get_streams(video_id: str):
+    """指定した YouTube の video_id のストリーム情報を返す"""
+    return await _fetch_and_cache_info(video_id)
+
+
+# ==============================================================================
 # エンドポイント 2: /m3u8/{video_id} (HLS/DASHマニフェスト)
 # ==============================================================================
 @app.get("/m3u8/{video_id}")
 async def get_m3u8_streams(video_id: str):
     """指定した YouTube の video_id の m3u8 (HLS/DASHマニフェスト) ストリームを返す"""
     
-    # 既存の /stream のロジックを呼び出して、キャッシュを利用しつつフルデータを取得
+    # キャッシュを利用しつつフルデータを取得
     try:
-        info_data = await get_streams(video_id)
+        info_data = await _fetch_and_cache_info(video_id)
     except HTTPException as e:
         raise e
 
@@ -153,48 +161,49 @@ async def get_m3u8_streams(video_id: str):
 
 
 # ==============================================================================
-# エンドポイント 3: /high/{video_id} (最高画質ストリームURL - webm優先)
+# エンドポイント 3: /high/{video_id} (最高画質ストリームURL - googlevideo.com優先)
 # ==============================================================================
 @app.get("/high/{video_id}")
 async def get_high_quality_stream(video_id: str):
-    """指定した YouTube の video_id の最高画質ストリームURL (webm優先) を返す"""
+    """指定した YouTube の video_id の最高画質ストリームURL (googlevideo.com の直接URL) を返す"""
     
-    # 既存の /stream のロジックを呼び出して、キャッシュを利用しつつフルデータを取得
+    # キャッシュを利用しつつフルデータを取得
     try:
-        info_data = await get_streams(video_id)
+        info_data = await _fetch_and_cache_info(video_id)
     except HTTPException as e:
         raise e
 
     # --- フィルタリングロジック ---
-    best_format = None
     formats = info_data["formats"]
+    best_format = None
 
-    # 1. 統合ストリーム (動画+音声) の抽出
-    combined_formats = [
+    # 1. 統合ストリーム (動画+音声) かつ googlevideo.com の直接URL のみを抽出
+    target_combined_formats = [
         f for f in formats 
-        if f.get("acodec") not in ["none", None] and f.get("vcodec") not in ["none", None]
+        if f.get("acodec") not in ["none", None] 
+        and f.get("vcodec") not in ["none", None]
+        # マニフェストを除外 (m3u8, mpd)
+        and f.get("protocol") not in ["m3u8_native", "http_dash_segments"] 
+        # googlevideo.com の直接URLに限定
+        and "googlevideo.com" in f.get("url", "") 
     ]
 
-    # 2. 統合ストリームの中で最高品質 (vbr/abrが高い) かつ webm 形式を優先して選択
-    if combined_formats:
-        # vbr (動画ビットレート) を基準に降順でソート
-        sorted_combined = sorted(combined_formats, key=lambda x: x.get("vbr") or 0, reverse=True)
-        
-        # webm 形式を探す
-        webm_format = next((f for f in sorted_combined if f.get("ext") == "webm"), None)
-        
-        if webm_format:
-            best_format = webm_format
-        else:
-            # webm がなければ、統合ストリームの中で最高画質のものを選ぶ
-            best_format = sorted_combined[0]
-
-
-    # 3. 統合ストリームが見つからなかった場合のフォールバック (最高画質の動画ストリーム)
+    # 2. 抽出された統合ストリームの中で最高品質のものを選ぶ
+    if target_combined_formats:
+        # vbr (動画ビットレート) を基準に降順でソートして、最初のものを選ぶ
+        sorted_combined = sorted(target_combined_formats, key=lambda x: x.get("vbr") or 0, reverse=True)
+        best_format = sorted_combined[0]
+    
+    # 3. 統合ストリームが見つからなかった場合のフォールバック (最高画質の分離ストリーム)
     if not best_format:
+        
+        # googlevideo.com の分離ストリームのみを抽出
         separated_formats = [
             f for f in formats 
-            if (f.get("acodec") in ["none", None] or f.get("vcodec") in ["none", None]) and f.get("url")
+            if (f.get("acodec") in ["none", None] or f.get("vcodec") in ["none", None]) 
+            and f.get("url")
+            and "googlevideo.com" in f.get("url", "")
+            and f.get("protocol") not in ["m3u8_native", "http_dash_segments"]
         ]
         
         # 最高の動画ストリーム (vcodecがあり、acodecがない)
@@ -208,11 +217,9 @@ async def get_high_quality_stream(video_id: str):
         
         if best_video:
             best_format = best_video
-            best_format['note'] = 'NOTE: This is a separate video stream (no audio) because no combined stream was found.'
+            best_format['note'] = 'NOTE: This is a separate video stream (no audio) and the best direct video URL found.'
         else:
-             # 動画ストリームも見つからない場合、最高音質をフォールバックとして返すことも可能だが、
-             # ユーザー要求は「最高画質」なのでここではエラーとする
-             raise HTTPException(status_code=404, detail="最高画質のストリームURLが見つかりませんでした。")
+             raise HTTPException(status_code=404, detail="googlevideo.com からの直接的なストリームURLが見つかりませんでした。")
 
     # 4. 応答データの整理
     high_response = {
