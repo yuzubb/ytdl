@@ -30,7 +30,7 @@ ydl_opts = {
     # 最高画質と最高音声を組み合わせる形式で情報を取得
     "format": "bestvideo+bestaudio/best", 
     # プロキシ設定は環境変数で管理することを推奨しますが、ここではコードを維持
-    "proxy": "http://ytproxy-siawaseok.duckdns.org:3007" 
+    "proxy": "https://siawaseok.duckdns.org:3007" 
 }
 
 # キャッシュ: { video_id: (timestamp, data, duration) }
